@@ -3,13 +3,14 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
+	"flag"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -18,21 +19,27 @@ const (
 	metaURL = "https://go.googlesource.com/?b=maser&format=JSON"
 )
 
+var (
+	pollInterval = flag.Duration("poll", 10*time.Second, "Remote poll inerval")
+	listenAddr   = flag.String("listen", "localhost:8080", "HTTP listen address")
+)
+
 // https://pkg.go.dev/net/http/httputil#ReverseProxy ReverseProxy has no zero values
 type Proxy struct {
+	// owned by poll loop
+	last string // signature of gorepo+toolsrepo
+	side string
+
 	mu    sync.Mutex
 	proxy *httputil.ReverseProxy
 }
 
 func main() {
-
-	fmt.Println("%#v", gerritMetaMap())
-	return
-
+	flag.Parse()
 	p := new(Proxy)
 	go p.run()
 	http.Handle("/", p)
-	log.Fatal(http.ListenAndServe("localhost:8080", nil))
+	log.Fatal(http.ListenAndServe(*listenAddr, nil))
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -55,8 +62,35 @@ func (p *Proxy) serveStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) run() {
+	p.side = "a"
 	for {
+		p.poll()
+		time.Sleep(*pollInterval)
 	}
+}
+
+func (p *Proxy) poll() {
+	heads := gerritMetaMap()
+	if heads == nil {
+		return
+	}
+	sig := heads["go"] + "-" + heads["tools"]
+	if sig == p.last {
+		return
+	}
+	newSide := "b"
+	if p.side == "b" {
+		newSide = "a"
+	}
+	hostport, err := p.initSide(newSide)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+}
+
+func (p *Proxy) initSide(side string) (hostport string, err error) {
+
 }
 
 // gerritMetaMap returns the map from repo name (e.g. "go") to its
