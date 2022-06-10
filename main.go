@@ -29,12 +29,10 @@ var (
 
 // https://pkg.go.dev/net/http/httputil#ReverseProxy ReverseProxy has no zero values
 type Proxy struct {
-	// owned by poll loop
-	last string // signature of gorepo+toolsrepo
-	side string
-
-	mu    sync.Mutex
+	mu    sync.Mutex // owns the following
 	proxy *httputil.ReverseProxy
+	last  string // signature of gorepo+toolsrepo
+	side  string
 }
 
 func main() {
@@ -60,10 +58,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	proxy.ServeHTTP(w, r)
 }
-func (p *Proxy) serveStatus(w http.ResponseWriter, r *http.Request) {
 
+func (p *Proxy) serveStatus(w http.ResponseWriter, r *http.Request) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fmt.Fprintf(w, "side=%v\nlast=%v\n", p.side, p.last)
 }
 
+// run runs in its own goroutine
 func (p *Proxy) run() {
 	p.side = "a"
 	for {
@@ -72,17 +74,25 @@ func (p *Proxy) run() {
 	}
 }
 
+// poll runs from the run loop goroutine
 func (p *Proxy) poll() {
 	heads := gerritMetaMap()
 	if heads == nil {
 		return
 	}
+	p.mu.Lock()
+	curSide := p.side
+	lastSig := p.last
+	p.mu.Unlock()
 	sig := heads["go"] + "-" + heads["tools"]
-	if sig == p.last {
+
+	if sig == lastSig {
 		return
 	}
+
 	newSide := "b"
-	if p.side == "b" {
+
+	if curSide == "b" {
 		newSide = "a"
 	}
 	hostport, err := p.initSide(newSide, heads["go"], heads["tools"])
@@ -100,6 +110,7 @@ func (p *Proxy) poll() {
 	}
 	p.side = newSide
 	p.proxy = httputil.NewSingleHostReverseProxy(u)
+	p.last = sig
 }
 
 func (p *Proxy) initSide(side, goHash, toolsHash string) (hostport string, e error) {
@@ -118,12 +129,16 @@ func (p *Proxy) initSide(side, goHash, toolsHash string) (hostport string, e err
 
 	env := []string{"GOROOT=" + goDir, "GOPATH=" + filepath.Join(dir, "gopath")}
 	make := exec.Command("./make.bash")
+	make.Stdout = os.Stdout
+	make.Stderr = os.Stderr
 	make.Dir = filepath.Join(goDir, "src")
 	if err := make.Run(); err != nil {
 		return "", err
 	}
 	goBin := filepath.Join(goDir, "bin/go")
 	install := exec.Command(goBin, "install", "golang.org/x/tools/cmd/godoc")
+	install.Stdout = os.Stdout
+	install.Stderr = os.Stderr
 	install.Env = env
 	if err := install.Run(); err != nil {
 		return "", err
