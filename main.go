@@ -4,11 +4,16 @@ import (
 	"bufio"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -82,15 +87,68 @@ func (p *Proxy) poll() {
 	if p.side == "b" {
 		newSide = "a"
 	}
-	hostport, err := p.initSide(newSide)
+	hostport, err := p.initSide(newSide, heads["go"], heads["tools"])
 	if err != nil {
 		log.Println(err)
 		return
 	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	u, err := url.Parse(fmt.Sprintf("http://%v/", hostport))
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	p.side = newSide
+	p.proxy = httputil.NewSingleHostReverseProxy(u)
 }
 
-func (p *Proxy) initSide(side string) (hostport string, err error) {
+func (p *Proxy) initSide(side, goHash, toolsHash string) (hostport string, err error) {
+	dir := filepath.Join(os.TempDir(), "godoc", side)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", err
+	}
+	goDir := filepath.Join(dir, "go")
+	toolsDir := filepath.Join(dir, "gopath/src/golang.org/x/tools")
+	if err = checkout("https://go.googlesource.com/go", goHash, goDir); err != nil {
+		return "", err
+	}
+	if err = checkout("https://go.googlesource.com/tools", toolsHash, toolsDir); err != nil {
+		return "", err
+	}
+	return "", nil
+}
 
+func checkout(repo, hash, path string) error {
+
+	// Clone git repoif it doesn't exist
+	fullPath := filepath.Join(path, ".git")
+
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Base(path), 0755); err != nil {
+			return err
+		}
+		if err := exec.Command("git", "clone", repo, path).Run(); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+
+	cmd := exec.Command("git", "fetch")
+	cmd.Dir = path
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	cmd = exec.Command("git", "reset", "--hard", hash)
+	cmd.Dir = path
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	cmd = exec.Command("git", "clean", "-d", "-f", "-x")
+	cmd.Dir = path
+	return cmd.Run()
 }
 
 // gerritMetaMap returns the map from repo name (e.g. "go") to its
