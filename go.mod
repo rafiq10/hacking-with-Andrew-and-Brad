@@ -1,4 +1,4 @@
-module hacking1-2015.com
+module hacking2015.com
 
 go 1.18
 

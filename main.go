@@ -16,12 +16,10 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 const (
-	metaURL = "https://go.googlesource.com/?b=maser&format=JSON"
+	metaURL = "https://go.googlesource.com/?b=master&format=JSON"
 )
 
 var (
@@ -104,20 +102,68 @@ func (p *Proxy) poll() {
 	p.proxy = httputil.NewSingleHostReverseProxy(u)
 }
 
-func (p *Proxy) initSide(side, goHash, toolsHash string) (hostport string, err error) {
+func (p *Proxy) initSide(side, goHash, toolsHash string) (hostport string, e error) {
 	dir := filepath.Join(os.TempDir(), "godoc", side)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
 	goDir := filepath.Join(dir, "go")
 	toolsDir := filepath.Join(dir, "gopath/src/golang.org/x/tools")
-	if err = checkout("https://go.googlesource.com/go", goHash, goDir); err != nil {
+	if err := checkout("https://go.googlesource.com/go", goHash, goDir); err != nil {
 		return "", err
 	}
-	if err = checkout("https://go.googlesource.com/tools", toolsHash, toolsDir); err != nil {
+	if err := checkout("https://go.googlesource.com/tools", toolsHash, toolsDir); err != nil {
 		return "", err
 	}
-	return "", nil
+
+	env := []string{"GOROOT=" + goDir, "GOPATH=" + filepath.Join(dir, "gopath")}
+	make := exec.Command("./make.bash")
+	make.Dir = filepath.Join(goDir, "src")
+	if err := make.Run(); err != nil {
+		return "", err
+	}
+	goBin := filepath.Join(goDir, "bin/go")
+	install := exec.Command(goBin, "install", "golang.org/x/tools/cmd/godoc")
+	install.Env = env
+	if err := install.Run(); err != nil {
+		return "", err
+	}
+
+	godocBin := filepath.Join(goDir, "bin/godoc")
+	hostport = "localhost:8081"
+	if side == "b" {
+		hostport = "localhost:8082"
+	}
+	godoc := exec.Command(godocBin, "-http="+hostport)
+	godoc.Env = env
+	godoc.Stdout = os.Stdout
+	godoc.Stderr = os.Stderr
+	if err := godoc.Start(); err != nil {
+		return "", err
+	}
+	go func() {
+		// TODO: tell the proxy that this side is dead
+		if err := godoc.Wait(); err != nil {
+			log.Printf("side %v exited: %v", side, err)
+		}
+	}()
+
+	var err error
+	for i := 0; i < 15; i++ {
+		time.Sleep(time.Second)
+
+		var res *http.Response
+		res, err = http.Get(fmt.Sprintf("https://%v/", hostport))
+		if err != nil {
+			continue
+		}
+		res.Body.Close()
+		if res.StatusCode == http.StatusOK {
+			return hostport, nil
+		}
+
+	}
+	return "", fmt.Errorf("timed out waiting for the side %v at %v (%v)", side, hostport, err)
 }
 
 func checkout(repo, hash, path string) error {
@@ -129,7 +175,10 @@ func checkout(repo, hash, path string) error {
 		if err := os.MkdirAll(filepath.Base(path), 0755); err != nil {
 			return err
 		}
-		if err := exec.Command("git", "clone", repo, path).Run(); err != nil {
+		cmd := exec.Command("git", "clone", repo, path)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
 			return err
 		}
 	} else if err != nil {
@@ -137,16 +186,22 @@ func checkout(repo, hash, path string) error {
 	}
 
 	cmd := exec.Command("git", "fetch")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	cmd.Dir = path
 	if err := cmd.Run(); err != nil {
 		return err
 	}
 	cmd = exec.Command("git", "reset", "--hard", hash)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	cmd.Dir = path
 	if err := cmd.Run(); err != nil {
 		return err
 	}
 	cmd = exec.Command("git", "clean", "-d", "-f", "-x")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	cmd.Dir = path
 	return cmd.Run()
 }
@@ -165,7 +220,7 @@ func gerritMetaMap() map[string]string {
 		return nil
 	}
 	var meta map[string]struct {
-		b map[string]struct{}
+		Branches map[string]string
 	}
 	br := bufio.NewReader(res.Body)
 	// For security reasons or something, this URL starts with ")]}'\n" before
@@ -185,8 +240,10 @@ func gerritMetaMap() map[string]string {
 		return nil
 	}
 	m := map[string]string{}
-	for repo, _ := range meta {
-		m[repo] = uuid.New().String()
+	for repo, v := range meta {
+		if master, ok := v.Branches["master"]; ok {
+			m[repo] = master
+		}
 	}
 	return m
 }
